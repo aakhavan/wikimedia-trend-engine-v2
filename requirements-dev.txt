@@ -1,0 +1,5 @@
+pytest
+pytest-mock  # For mocking external services like AWS
+apache-airflow # Needed to test the DAG object
+apache-airflow-providers-amazon
+pyspark~=3.4.0

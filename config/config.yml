@@ -1,0 +1,31 @@
+# Central configuration for the Wikimedia Trends v2 Project
+
+aws:
+  region: "eu-central-1"
+  # These values will be populated from Terraform outputs after deployment
+  s3_bucket: "<YOUR_S3_BUCKET_NAME>"
+  kinesis_stream_name: "wikimedia-trends-v2-stream"
+  emr_serverless_app_id: "<YOUR_EMR_APP_ID>"
+  emr_execution_role_arn: "<YOUR_EMR_ROLE_ARN>"
+
+wikimedia:
+  stream_url: "https://stream.wikimedia.org/v2/stream/recentchange"
+
+airflow:
+  # Configuration for the batch processing DAG
+  batch_job:
+    iceberg_db_name: "wikimedia-trends-v2-db"
+    iceberg_table_name: "recent_changes_batch"
+    # Path where raw data for batch processing would be stored
+    s3_input_path_prefix: "raw_json/wikimedia/"
+    # Path where the batch job script is stored
+    s3_script_path_prefix: "spark_scripts/batch_job.py"
+
+spark:
+  # Common Spark-Iceberg configurations used by Airflow to submit jobs
+  iceberg_configs:
+    spark.sql.extensions: "org.apache.iceberg.spark.extensions.SparkSqlExtensions"
+    spark.sql.catalog.glue_catalog: "org.apache.iceberg.spark.SparkCatalog"
+    spark.sql.catalog.glue_catalog.catalog-impl: "org.apache.iceberg.aws.glue.GlueCatalog"
+    spark.sql.catalog.glue_catalog.io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+    # The warehouse path will be constructed dynamically in the DAG

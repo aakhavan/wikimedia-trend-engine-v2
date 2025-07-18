@@ -1,0 +1,57 @@
+version: '3'
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - AIRFLOW__CORE__ENABLE_XCOM_PICKLING=True
+    - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+    # --- ADD THIS LINE ---
+    # Add our project's code to the Python path so Airflow can import it
+    - PYTHONPATH=/opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    # --- ADD THESE LINES ---
+    # Mount the src and config directories so the DAG can access them
+    - ./src:/opt/airflow/src
+    - ./config:/opt/airflow/config
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}"
+
+services:
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Install provider packages
+        pip install apache-airflow-providers-amazon
+
+        # Initialize the database and create a default user
+        airflow db init
+        airflow users create \
+          --username airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com \
+          --password airflow

@@ -61,8 +61,9 @@ resource "aws_instance" "airflow_host" {
 
               # Clone repo and start Airflow
               cd /home/ec2-user
-              git clone https://github.com/aakhavan/wikimedia-trend-engine-cloud.git
-              cd wikimedia-trend-engine-cloud
+              # --- THIS LINE IS CORRECTED ---
+              git clone https://github.com/aakhavan/wikimedia-trend-engine-v2.git
+              cd wikimedia-trend-engine-v2
 
               # Set Airflow UID to not have permissions issues with mounted volumes
               echo -e "AIRFLOW_UID=$(id -u ec2-user)\nAIRFLOW_GID=0" > .env

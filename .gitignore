@@ -1,0 +1,72 @@
+# --- Terraform ---
+# Local Terraform state, plugins, and lock files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files to prevent accidental credential exposure.
+# If you need to version a non-sensitive vars file, use a specific override
+# like !example.tfvars
+*.tfvars
+*.tfvars.json
+
+# Ignore override files as they are typically used for local testing
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+
+# --- Python ---
+# Virtual Environment
+venv/
+*.venv
+.env
+
+# Byte-compiled / optimized / C extensions
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+
+# --- IDEs and Editors ---
+# JetBrains (PyCharm, IntelliJ)
+.idea/
+
+# Visual Studio Code
+.vscode/
+
+
+# --- Operating System Files ---
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
