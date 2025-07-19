@@ -1,6 +1,6 @@
 resource "aws_emrserverless_application" "spark_app" {
   name          = "${local.project_name}-spark-app"
-  release_label = "emr-6.15.0" # A recent and stable Spark 3 version
+  release_label = "emr-6.15.0" # A recent and stable Spark 3 version (Spark 3.4.1)
   type          = "SPARK"
 
   # Define a small initial capacity for the driver to start quickly.
