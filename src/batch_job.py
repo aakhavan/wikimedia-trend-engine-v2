@@ -1,57 +1,45 @@
-import sys
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
-from src.transformations import transform_wikimedia_data  # Import the shared function
+from pyspark.sql.functions import count, col
 
 
 class WikimediaBatchJob:
     """
-    Orchestrates the Spark batch job from S3 JSON files to an Iceberg table.
+    A batch job that reads from the streaming Iceberg table, performs an
+    aggregation, and writes the result to a new summary table.
     """
 
-    def __init__(self, input_path: str, output_table: str):
-        """Initializes the Spark session and job parameters."""
-        self.spark = SparkSession.builder.appName("WikimediaBatch").getOrCreate()
-        self.input_path = input_path
-        self.output_table = output_table
+    def __init__(self):
+        """Initializes the Spark session and retrieves job configurations."""
+        self.spark = SparkSession.builder.appName("WikimediaBatchAggregation").getOrCreate()
+        self.conf = self.spark.sparkContext.getConf()
+        self.iceberg_db_name = self.conf.get("spark.app.icebergDbName")
+        self.input_table = f"glue_catalog.{self.iceberg_db_name}.recent_changes_stream"
+        self.output_table = f"glue_catalog.{self.iceberg_db_name}.domain_edit_counts"
 
     def run(self):
-        """Executes the batch job."""
-        print(f"Reading raw JSON data from: {self.input_path}")
+        """Executes the batch aggregation job."""
+        print(f"Reading from input table: {self.input_table}")
 
-        # Read raw multiline JSON files as text. This ensures each JSON object
-        # is a single row, which we then place into a 'data' column to match
-        # the input format expected by our transformation function.
-        raw_df = self.spark.read.text(self.input_path) \
-            .select(col("value").alias("data"))
+        # Read the raw streaming data from the Iceberg table
+        streaming_data_df = self.spark.read.table(self.input_table)
 
-        # Apply the centralized, testable, functional transformation
-        processed_df = transform_wikimedia_data(raw_df)
+        # Perform a simple aggregation: count edits per domain
+        # This is a classic batch operation on streaming data.
+        domain_counts_df = streaming_data_df.groupBy("domain") \
+            .agg(count("*").alias("edit_count")) \
+            .orderBy(col("edit_count").desc())
 
-        # Using .cache() can be beneficial here if the count is expensive
-        # processed_df.cache()
-        record_count = processed_df.count()
-        print(f"Writing {record_count} records to Iceberg table: {self.output_table}")
+        print(f"Writing aggregation results to: {self.output_table}")
 
-        if record_count > 0:
-            # Append the transformed data to the target Iceberg table
-            processed_df.write \
-                .format("iceberg") \
-                .mode("append") \
-                .save(self.output_table)
-        else:
-            print("No new records to write. Skipping.")
+        # Write the aggregated data to a new Iceberg table, overwriting it each time
+        domain_counts_df.write \
+            .format("iceberg") \
+            .mode("overwrite") \
+            .save(self.output_table)
 
         print("Batch job completed successfully.")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: batch_job.py <s3_input_path> <iceberg_table_name>")
-        sys.exit(-1)
-
-    s3_input_path = sys.argv[1]
-    iceberg_table = sys.argv[2]
-
-    job = WikimediaBatchJob(input_path=s3_input_path, output_table=iceberg_table)
+    job = WikimediaBatchJob()
     job.run()

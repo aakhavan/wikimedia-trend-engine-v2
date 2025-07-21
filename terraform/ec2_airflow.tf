@@ -45,6 +45,7 @@ resource "aws_instance" "airflow_host" {
   subnet_id              = module.vpc.public_subnets[0]
   vpc_security_group_ids = [aws_security_group.airflow_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.airflow_instance_profile.name
+  associate_public_ip_address = true
 
   # This user_data script runs on instance startup.
   # It installs Docker, clones your repo, and starts Airflow.

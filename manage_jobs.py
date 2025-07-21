@@ -129,10 +129,18 @@ def main():
         config['aws']['s3_bucket'] = tf_outputs.get('data_lake_s3_bucket_name')
         config['aws']['emr_serverless_app_id'] = tf_outputs.get('emr_serverless_app_id')
         config['aws']['emr_execution_role_arn'] = tf_outputs.get('emr_execution_role_arn')
+        # --- THIS IS THE FIX ---
+        # Populate the Glue DB name from the new Terraform output.
+        config['airflow']['batch_job']['iceberg_db_name'] = tf_outputs.get('glue_database_name')
 
         # Simple validation
-        if not all([config['aws']['s3_bucket'], config['aws']['emr_serverless_app_id'], config['aws']['emr_execution_role_arn']]):
-            raise ValueError("Could not populate all required AWS config values from Terraform outputs.")
+        if not all([
+            config['aws']['s3_bucket'],
+            config['aws']['emr_serverless_app_id'],
+            config['aws']['emr_execution_role_arn'],
+            config['airflow']['batch_job']['iceberg_db_name']
+        ]):
+            raise ValueError("Could not populate all required config values from Terraform outputs.")
 
     except Exception as e:
         logging.error(f"Failed to build job configuration: {e}")

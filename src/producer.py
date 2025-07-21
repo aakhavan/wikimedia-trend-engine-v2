@@ -2,10 +2,11 @@ import json
 import boto3
 import requests
 import logging
+import time
 from botocore.exceptions import ClientError
 from src.config_loader import config
 
-# Configure logging for better visibility
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -19,11 +20,14 @@ class WikimediaProducer:
         """Initializes the producer, setting up configuration and clients."""
         self.config = config
         self.stream_url = self.config['wikimedia']['stream_url']
+        # --- THIS IS THE FIX ---
+        # Read the target domains from config. It's now a list.
+        self.target_domains = self.config['wikimedia'].get('target_domains')
         self.kinesis_stream_name = self.config['aws']['kinesis_stream_name']
         self.aws_region = self.config['aws']['region']
         self.kinesis_client = self._get_kinesis_client()
-        # Using a requests.Session is a best practice for performance
         self.session = requests.Session()
+        self.retry_delay = 5
 
     def _get_kinesis_client(self):
         """Initializes and returns a Boto3 Kinesis client."""
@@ -38,10 +42,7 @@ class WikimediaProducer:
             raise
 
     def _send_to_kinesis(self, record: dict):
-        """
-        Sends a single JSON record to the Kinesis stream.
-        Uses the event's domain as the partition key for good data distribution.
-        """
+        """Sends a single JSON record to the Kinesis stream."""
         try:
             partition_key = record.get('meta', {}).get('domain', 'default_domain')
             data = json.dumps(record).encode('utf-8')
@@ -56,29 +57,49 @@ class WikimediaProducer:
     def run(self):
         """
         Main run loop. Connects to the stream and processes events indefinitely.
+        Automatically retries the connection if it drops.
         """
         if not self.kinesis_client:
             logging.error("Kinesis client not available. Aborting run.")
             return
 
-        logging.info(f"Connecting to Wikimedia SSE stream: {self.stream_url}")
-        try:
-            with self.session.get(self.stream_url, stream=True, timeout=30) as response:
-                response.raise_for_status()
-                logging.info("Connection successful. Listening for events...")
-                for line in response.iter_lines():
-                    if line and line.startswith(b'data: '):
-                        try:
-                            json_str = line.decode('utf-8')[6:]
-                            record = json.loads(json_str)
-                            logging.info(f"Received event for domain: {record.get('meta', {}).get('domain')}")
-                            self._send_to_kinesis(record)
-                        except json.JSONDecodeError:
-                            logging.debug(f"Skipping non-JSON data line: {line}")
-                        except Exception as e:
-                            logging.error(f"An unexpected error occurred while processing a line: {e}")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Fatal error connecting to the Wikimedia stream: {e}")
+
+        if self.target_domains:
+            logging.info(f"Filtering is ACTIVE. Only ingesting data for domains: {self.target_domains}")
+        else:
+            logging.info("No target domains specified. Ingesting data for ALL domains.")
+
+
+        while True:
+            try:
+                logging.info(f"Connecting to Wikimedia SSE stream: {self.stream_url}")
+                with self.session.get(self.stream_url, stream=True, timeout=30) as response:
+                    response.raise_for_status()
+                    logging.info("Connection successful. Listening for events...")
+                    for line in response.iter_lines():
+                        if line and line.startswith(b'data: '):
+                            try:
+                                json_str = line.decode('utf-8')[6:]
+                                record = json.loads(json_str)
+                                current_domain = record.get('meta', {}).get('domain')
+
+                                if not self.target_domains or current_domain in self.target_domains:
+                                    logging.info(f"Processing event for domain: {current_domain}")
+                                    self._send_to_kinesis(record)
+
+                            except json.JSONDecodeError:
+                                logging.debug(f"Skipping non-JSON data line: {line}")
+                            except Exception as e:
+                                logging.error(f"An unexpected error occurred while processing a line: {e}")
+
+            # Catch any network-related exceptions from the requests library
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Connection dropped: {e}. Retrying in {self.retry_delay} seconds...")
+                time.sleep(self.retry_delay)
+            # Catch any other unexpected errors to prevent the script from crashing
+            except Exception as e:
+                logging.error(f"An unexpected fatal error occurred: {e}. Retrying in {self.retry_delay} seconds...")
+                time.sleep(self.retry_delay)
 
 
 if __name__ == "__main__":

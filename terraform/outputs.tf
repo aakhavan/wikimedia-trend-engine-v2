@@ -22,3 +22,9 @@ output "airflow_public_ip" {
   description = "The public IP address of the EC2 instance hosting Airflow."
   value       = aws_instance.airflow_host.public_ip
 }
+
+
+output "glue_database_name" {
+  description = "The name of the AWS Glue Catalog database for Iceberg."
+  value       = aws_glue_catalog_database.iceberg_db.name
+}

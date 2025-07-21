@@ -15,10 +15,9 @@ resource "aws_emrserverless_application" "spark_app" {
     }
   }
 
-  # Set maximum capacity to prevent runaway costs.
   maximum_capacity {
-    cpu    = "4vCPU"
-    memory = "8GB"
+    cpu    = "8vCPU"
+    memory = "32GB"
   }
 
   tags = local.common_tags
