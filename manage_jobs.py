@@ -1,157 +1,201 @@
-import argparse
-import logging
+# File: manage_jobs.py
 import boto3
-import yaml
-from pathlib import Path
-import time
-from botocore.exceptions import ClientError
-import subprocess
 import json
+import click
+import os
+import time
+import subprocess
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+class EMRServerlessController:
+    """A class to manage EMR Serverless jobs."""
 
-def get_terraform_outputs() -> dict:
-    """
-    Runs 'terraform output -json' and returns the parsed outputs.
-    This makes the script self-sufficient and always uses live data.
-    """
-    logging.info("Fetching live infrastructure details from Terraform...")
-    try:
-        result = subprocess.run(
-            ["terraform", "output", "-json"],
-            capture_output=True, text=True, check=True, cwd="./terraform"
+    def __init__(self, project_name):
+        self.project_name = project_name
+        self.sts_client = boto3.client("sts")
+        self.account_id = self.sts_client.get_caller_identity()["Account"]
+
+        # Get configuration directly from Terraform state for robustness
+        self.tf_outputs = self._get_terraform_outputs()
+        self.aws_region = self.tf_outputs["aws_region"]["value"]
+        self.s3_bucket_name = self.tf_outputs["s3_bucket_name"]["value"]
+        self.kinesis_stream_name = self.tf_outputs["kinesis_stream_name"]["value"]
+        self.iceberg_db_name = self.tf_outputs["iceberg_db_name"]["value"]
+
+        # Initialize the EMR client *after* getting the region
+        self.emr_client = boto3.client("emr-serverless", region_name=self.aws_region)
+
+        self.app_id = self._get_and_start_app()
+        self.execution_role_arn = f"arn:aws:iam::{self.account_id}:role/{self.project_name}-emr-serverless-role"
+
+    def _get_terraform_outputs(self):
+        """Runs `terraform output` and returns the parsed JSON."""
+        print("Fetching configuration from terraform outputs...")
+        try:
+            # Assuming the script is run from the project root where terraform/ is a subdir
+            process = subprocess.run(
+                ["terraform", "output", "-json"],
+                cwd="./terraform",
+                capture_output=True,
+                text=True,
+                check=True,
+                shell=True  # For Windows PATH resolution
+            )
+            return json.loads(process.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"Error running `terraform output`. Stderr: {e.stderr}")
+            raise Exception("Could not fetch terraform outputs. Ensure you are in the project root and have run `terraform init/apply` in the 'terraform' directory.")
+        except FileNotFoundError:
+            raise Exception("`terraform` command not found. Is Terraform installed and in your PATH?")
+        except json.JSONDecodeError:
+            raise Exception("Failed to parse terraform output. Is the terraform state valid?")
+
+    def _get_and_start_app(self):
+        """
+        Retrieves the EMR Serverless application ID by name.
+        It handles CREATED, STARTED, and STOPPED states.
+        If the app is STOPPED, it will start it and wait for it to be ready.
+        """
+        # Look for the application in any non-terminal state
+        response = self.emr_client.list_applications(
+            states=["CREATING", "CREATED", "STARTED", "STOPPING", "STOPPED"]
         )
-        outputs = json.loads(result.stdout)
-        # The output values are nested, so we extract them
-        return {key: value['value'] for key, value in outputs.items()}
-    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
-        logging.error(f"Failed to get Terraform outputs: {e}")
-        logging.error("Please ensure you are in the project root and Terraform has been applied.")
-        raise
+        app_name_prefix = f"{self.project_name}-spark-app"
 
+        found_app = None
+        for app in response["applications"]:
+            if app["name"].startswith(app_name_prefix):
+                found_app = app
+                break
 
-def get_base_config() -> dict:
-    """Loads the base configuration template from the local file."""
-    try:
-        config_path = Path(__file__).parent / 'config/config.yml'
-        with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
-    except (FileNotFoundError, yaml.YAMLError) as e:
-        logging.error(f"Could not load or parse base config/config.yml. Error: {e}")
-        raise
+        if not found_app:
+            raise Exception(f"No EMR Serverless application found with prefix '{app_name_prefix}'. Please run `terraform apply`.")
 
+        app_id = found_app["id"]
+        app_state = found_app["state"]
 
-def start_streaming_job(emr_client, config: dict):
-    """
-    Constructs and starts the EMR Serverless streaming job using the live config.
-    """
-    aws_config = config['aws']
-    s3_bucket = aws_config['s3_bucket']
-    emr_app_id = aws_config['emr_serverless_app_id']
-    emr_role_arn = aws_config['emr_execution_role_arn']
+        print(f"Found application {app_id} in state: {app_state}")
 
-    job_name = f"wikimedia-streaming-job-{int(time.time())}"
-    logging.info(f"Starting streaming job with name: {job_name}")
+        if app_state == "STOPPED":
+            print("Application is STOPPED. Starting it now...")
+            self.emr_client.start_application(applicationId=app_id)
 
-    entry_point = f"s3://{s3_bucket}/spark_scripts/streaming_job.py"
+            # Wait for the application to become STARTED
+            while app_state not in ["STARTED", "CREATED"]:
+                time.sleep(10)  # Wait for 10 seconds before checking again
+                app_details = self.emr_client.get_application(applicationId=app_id)
+                app_state = app_details["application"]["state"]
+                print(f"  ... current application state: {app_state}")
+                if app_state in ["TERMINATED", "STOPPING"]:
+                    raise Exception(f"Application {app_id} entered a terminal state while trying to start.")
 
-    # The streaming job gets its specific parameters from the config file.
-    # We pass these as --conf arguments to the Spark job.
-    spark_submit_params = (
-        f"--conf spark.app.kinesisStreamName={aws_config['kinesis_stream_name']} "
-        f"--conf spark.app.awsRegion={aws_config['region']} "
-        f"--conf spark.app.icebergDbName={config['airflow']['batch_job']['iceberg_db_name']} "
-        f"--conf spark.app.s3BucketName={s3_bucket}"
-    )
+        if app_state not in ["CREATED", "STARTED"]:
+            raise Exception(f"Application {app_id} is in an unhandled state: {app_state}")
 
-    try:
-        response = emr_client.start_job_run(
-            applicationId=emr_app_id,
-            executionRoleArn=emr_role_arn,
-            name=job_name,
-            jobDriver={
-                'sparkSubmit': {
-                    'entryPoint': entry_point,
-                    'sparkSubmitParameters': spark_submit_params
+        print(f"Application {app_id} is ready.")
+        return app_id
+
+    def _get_streaming_job_config(self):
+        """Returns the configuration for the streaming job."""
+        return {
+            "name": "Wikimedia DStream Job",
+            "sparkSubmitParameters": (
+                "--conf spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.3,"
+                "org.apache.spark:spark-streaming-kinesis-asl_2.12:3.4.1 "
+                # --- Python Dependency Management ---
+                # This is the key fix: Tells Spark to download our zipped helper modules
+                # and add them to the PYTHONPATH so they can be imported.
+                f"--py-files s3://{self.s3_bucket_name}/spark_scripts/src.zip "
+                # --- Spark Configuration ---
+                # These settings are passed to the Spark job.
+                "--conf spark.driver.cores=2 "
+                # We scale this down to 1 for a cost-effective proof-of-concept.
+                "--conf spark.executor.instances=1 "
+                "--conf spark.executor.cores=2 "
+                "--conf spark.executor.memory=8g "
+                # --- Iceberg Configuration ---
+                # Tells Spark to use the Iceberg extension and sets up the Glue Catalog.
+                "--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.SparkSqlExtensions "
+                "--conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog "
+                f"--conf spark.sql.catalog.glue_catalog.warehouse=s3://{self.s3_bucket_name}/iceberg_warehouse "
+                "--conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog "
+                # --- Application-specific parameters ---
+                # These are retrieved inside the Spark job.
+                f"--conf spark.app.kinesisStreamName={self.kinesis_stream_name} "
+                f"--conf spark.app.awsRegion={self.aws_region} "
+                f"--conf spark.app.icebergDbName={self.iceberg_db_name}"
+            )
+        }
+
+    def start_job(self, job_type):
+        """Starts a new EMR Serverless job."""
+        if job_type == "streaming":
+            job_driver = {
+                "sparkSubmit": {
+                    "entryPoint": f"s3://{self.s3_bucket_name}/spark_scripts/streaming_job.py",
+                    "entryPointArguments": [],
+                    "sparkSubmitParameters": self._get_streaming_job_config()["sparkSubmitParameters"]
                 }
-            },
-            # --- THIS IS THE FIX ---
-            # Provide job-specific configurations, including required packages.
+            }
+            job_name = self._get_streaming_job_config()["name"]
+        else:
+            raise ValueError(f"Unknown job type: {job_type}")
+
+        print(f"Starting '{job_name}' on application {self.app_id}...")
+        response = self.emr_client.start_job_run(
+            applicationId=self.app_id,
+            executionRoleArn=self.execution_role_arn,
+            jobDriver=job_driver,
+            name=job_name,
             configurationOverrides={
                 "monitoringConfiguration": {
-                    "s3MonitoringConfiguration": {"logUri": f"s3://{s3_bucket}/logs/emr-serverless/streaming/"}
-                },
-                "applicationConfiguration": [
-                    {
-                        "classification": "spark-defaults",
-                        "properties": {
-                            "spark.jars.packages": "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2,org.apache.spark:spark-sql-kinesis-assembly_2.12:3.4.1",
-                            "spark.sql.extensions": "org.apache.iceberg.spark.extensions.SparkSqlExtensions",
-                            "spark.sql.catalog.glue_catalog": "org.apache.iceberg.spark.SparkCatalog",
-                            "spark.sql.catalog.glue_catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
-                            "spark.sql.catalog.glue_catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
-                            "spark.sql.catalog.glue_catalog.warehouse": f"s3://{s3_bucket}/data/"
-                        }
+                    "s3MonitoringConfiguration": {
+                        "logUri": f"s3://{self.s3_bucket_name}/logs/emr-serverless/{job_type}/"
                     }
-                ]
+                }
             }
         )
-        job_run_id = response['jobRunId']
-        logging.info(f"✅ Successfully started streaming job. Job Run ID: {job_run_id}")
-        logging.info("Monitor its status in the AWS EMR Serverless console.")
-        return job_run_id
-    except ClientError as e:
-        logging.error(f"❌ Failed to start streaming job: {e}")
-        raise
+        print(f"Job started successfully! Run ID: {response['jobRunId']}")
+
+    def get_job_status(self, run_id):
+        """Gets the status of a specific job run."""
+        response = self.emr_client.get_job_run(applicationId=self.app_id, jobRunId=run_id)
+        print(json.dumps(response["jobRun"], indent=4, default=str))
+
+    def cancel_job(self, run_id):
+        """Cancels a running job."""
+        self.emr_client.cancel_job_run(applicationId=self.app_id, jobRunId=run_id)
+        print(f"Job {run_id} cancellation request sent.")
 
 
-def main():
-    """
-    Main function to parse arguments and dispatch commands.
-    """
-    parser = argparse.ArgumentParser(description="Manage EMR Serverless Jobs for the Wikimedia Project")
-    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
-
-    # --- 'start' command ---
-    start_parser = subparsers.add_parser("start", help="Start a new job run")
-    start_parser.add_argument("job_type", choices=["streaming"], help="The type of job to start.")
-
-    args = parser.parse_args()
-
-    # --- Build the live configuration in memory ---
-    try:
-        tf_outputs = get_terraform_outputs()
-        config = get_base_config()
-
-        # Populate the config with live values from Terraform
-        config['aws']['s3_bucket'] = tf_outputs.get('data_lake_s3_bucket_name')
-        config['aws']['emr_serverless_app_id'] = tf_outputs.get('emr_serverless_app_id')
-        config['aws']['emr_execution_role_arn'] = tf_outputs.get('emr_execution_role_arn')
-        # --- THIS IS THE FIX ---
-        # Populate the Glue DB name from the new Terraform output.
-        config['airflow']['batch_job']['iceberg_db_name'] = tf_outputs.get('glue_database_name')
-
-        # Simple validation
-        if not all([
-            config['aws']['s3_bucket'],
-            config['aws']['emr_serverless_app_id'],
-            config['aws']['emr_execution_role_arn'],
-            config['airflow']['batch_job']['iceberg_db_name']
-        ]):
-            raise ValueError("Could not populate all required config values from Terraform outputs.")
-
-    except Exception as e:
-        logging.error(f"Failed to build job configuration: {e}")
-        exit(1)
-
-    emr_client = boto3.client("emr-serverless", region_name=config['aws']['region'])
-
-    if args.command == "start":
-        if args.job_type == "streaming":
-            start_streaming_job(emr_client, config)
+@click.group()
+def cli():
+    pass
 
 
-if __name__ == "__main__":
-    main()
+@cli.command()
+@click.argument('job_type', type=click.Choice(['streaming']))
+def start(job_type):
+    """Starts an EMR Serverless job."""
+    controller = EMRServerlessController(project_name="wikimedia-trends-v2")
+    controller.start_job(job_type)
+
+
+@cli.command()
+@click.argument('run_id')
+def status(run_id):
+    """Gets the status of a job run."""
+    controller = EMRServerlessController(project_name="wikimedia-trends-v2")
+    controller.get_job_status(run_id)
+
+
+@cli.command()
+@click.argument('run_id')
+def cancel(run_id):
+    """Cancels a job run."""
+    controller = EMRServerlessController(project_name="wikimedia-trends-v2")
+    controller.cancel_job(run_id)
+
+
+if __name__ == '__main__':
+    cli()

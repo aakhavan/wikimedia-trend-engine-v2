@@ -53,6 +53,33 @@ resource "aws_iam_policy" "emr_serverless_policy" {
           "arn:aws:glue:${data.aws_partition.current.id}:${data.aws_caller_identity.current.account_id}:database/${aws_glue_catalog_database.iceberg_db.name}",
           "arn:aws:glue:${data.aws_partition.current.id}:${data.aws_caller_identity.current.account_id}:table/${aws_glue_catalog_database.iceberg_db.name}/*"
         ]
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "dynamodb:CreateTable",
+          "dynamodb:DescribeTable",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem"
+        ],
+        Resource = "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/WikimediaStreamingDStream"
+      },
+      {
+        # --- THIS IS THE FINAL FIX ---
+        # Permissions for the EMR role to create and manage Elastic Network Interfaces (ENIs).
+        # This is required for the job to communicate with services via an Interface VPC Endpoint (like Kinesis).
+        # Without this, the connection to Kinesis will time out, as seen in the logs.
+        "Effect": "Allow",
+        "Action": [
+          "ec2:CreateNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSubnets"
+        ],
+        "Resource": "*"
       }
     ]
   })
@@ -131,6 +158,7 @@ resource "aws_iam_instance_profile" "airflow_instance_profile" {
   role = aws_iam_role.airflow_ec2_role.name
 }
 
-# Data sources to get the current account ID and partition (e.g., "aws")
+
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
+data "aws_region" "current" {} # Added to support the DynamoDB ARN

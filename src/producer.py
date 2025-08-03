@@ -54,10 +54,11 @@ class WikimediaProducer:
         except ClientError as e:
             logging.warning(f"Could not put record to Kinesis. SKIPPING. Error: {e}")
 
-    def run(self):
+    def run(self, run_duration_seconds: int = None):
         """
-        Main run loop. Connects to the stream and processes events indefinitely.
-        Automatically retries the connection if it drops.
+        Main run loop. Connects to the stream and processes events.
+        Can run indefinitely or for a fixed duration, which is ideal for development.
+        :param run_duration_seconds: If set, the producer will stop after this many seconds.
         """
         if not self.kinesis_client:
             logging.error("Kinesis client not available. Aborting run.")
@@ -69,8 +70,12 @@ class WikimediaProducer:
         else:
             logging.info("No target domains specified. Ingesting data for ALL domains.")
 
+        start_time = time.time()
 
         while True:
+            if run_duration_seconds and (time.time() - start_time) > run_duration_seconds:
+                logging.info(f"Run duration of {run_duration_seconds} seconds reached. Shutting down producer.")
+                break
             try:
                 logging.info(f"Connecting to Wikimedia SSE stream: {self.stream_url}")
                 with self.session.get(self.stream_url, stream=True, timeout=30) as response:
@@ -103,5 +108,8 @@ class WikimediaProducer:
 
 
 if __name__ == "__main__":
+    # producer = WikimediaProducer()
+    # producer.run()
+    logging.info("Starting producer in development mode for 10 minutes")
     producer = WikimediaProducer()
-    producer.run()
+    producer.run(run_duration_seconds=600)  # Run for 10 minutes

@@ -1,51 +1,63 @@
-from datetime import datetime, timedelta
+from __future__ import annotations
+import pendulum
 from airflow.models.dag import DAG
 from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
-# Import our new, standardized config loader
-from src.config_loader import config
 
-# --- CONFIGURATION FROM CENTRAL FILE ---
-aws_config = config['aws']
-batch_config = config['airflow']['batch_job']
-spark_config = config['spark']['iceberg_configs']
+# Use Airflow Variables for configuration. This is the standard, secure way.
+# You must set these in the Airflow UI (Admin -> Variables).
+EMR_SERVERLESS_APP_ID = "{{ var.value.emr_serverless_app_id }}"
+EMR_EXECUTION_ROLE_ARN = "{{ var.value.emr_execution_role_arn }}"
+S3_BUCKET_NAME = "{{ var.value.s3_bucket_name }}"
+GLUE_DATABASE_NAME = "{{ var.value.glue_database_name }}"
 
-EMR_SERVERLESS_APPLICATION_ID = aws_config['emr_serverless_app_id']
-EMR_EXECUTION_ROLE_ARN = aws_config['emr_execution_role_arn']
-S3_BUCKET = aws_config['s3_bucket']
-
-# Construct paths and table names from the config
-S3_SCRIPT_PATH = f"s3://{S3_BUCKET}/{batch_config['s3_script_path_prefix']}"
-S3_INPUT_PATH = f"s3://{S3_BUCKET}/{batch_config['s3_input_path_prefix']}"
-ICEBERG_TABLE = f"glue_catalog.{batch_config['iceberg_db_name']}.{batch_config['iceberg_table_name']}"
-
-# Dynamically add the S3 warehouse path to the Spark-Iceberg configurations
-SPARK_ICEBERG_CONFIG = spark_config.copy()
-SPARK_ICEBERG_CONFIG['spark.sql.catalog.glue_catalog.warehouse'] = f"s3://{S3_BUCKET}/warehouse"
-# --- END CONFIGURATION ---
+# Define S3 path for the script
+S3_SCRIPT_PATH = f"s3://{S3_BUCKET_NAME}/spark_scripts/batch_job.py"
 
 with DAG(
-    dag_id="wikimedia_batch_dag",
-    start_date=datetime(2024, 1, 1),
-    schedule_interval=timedelta(hours=1),
+    dag_id="wikimedia_daily_batch_aggregation",
+    # Using pendulum is a best practice for timezone-aware scheduling
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
     catchup=False,
-    tags=["wikimedia", "emr-serverless"],
+    # Using a standard cron preset is clear and easy to read
+    schedule="@daily",
+    tags=["wikimedia", "batch", "emr"],
+    doc_md="""
+    ### Wikimedia Daily Batch Aggregation DAG
+    Orchestrates a daily batch job on EMR Serverless.
+    Dependencies are downloaded automatically by Spark.
+    """,
 ) as dag:
-    start_emr_serverless_job = EmrServerlessStartJobOperator(
-        task_id="start_spark_batch_job",
-        application_id=EMR_SERVERLESS_APPLICATION_ID,
+    start_batch_job = EmrServerlessStartJobOperator(
+        task_id="start_emr_batch_job",
+        application_id=EMR_SERVERLESS_APP_ID,
         execution_role_arn=EMR_EXECUTION_ROLE_ARN,
         job_driver={
             "sparkSubmit": {
                 "entryPoint": S3_SCRIPT_PATH,
-                "entryPointArguments": [S3_INPUT_PATH, ICEBERG_TABLE],
-                "sparkSubmitParameters": " ".join([f"--conf {k}={v}" for k, v in SPARK_ICEBERG_CONFIG.items()])
+                # Pass dynamic values to the Spark job via --conf
+                "sparkSubmitParameters": f"--conf spark.app.icebergDbName={GLUE_DATABASE_NAME}",
             }
         },
+        # Use configuration_overrides for static environment setup
         configuration_overrides={
-            "monitoringConfiguration": {
-                "s3MonitoringConfiguration": {
-                    "logUri": f"s3://{S3_BUCKET}/logs/emr-serverless/"
+            "applicationConfiguration": [
+                {
+                    "classification": "spark-defaults",
+                    "properties": {
+                        # This line makes the DAG self-contained and reliable
+                        "spark.jars.packages": "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.3",
+                        # Standard Iceberg configurations
+                        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.SparkSqlExtensions",
+                        "spark.sql.catalog.glue_catalog": "org.apache.iceberg.spark.SparkCatalog",
+                        "spark.sql.catalog.glue_catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+                        "spark.sql.catalog.glue_catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+                        "spark.sql.catalog.glue_catalog.warehouse": f"s3://{S3_BUCKET_NAME}/data/"
+                    },
                 }
-            }
+            ],
+            "monitoringConfiguration": {
+                "s3MonitoringConfiguration": {"logUri": f"s3://{S3_BUCKET_NAME}/logs/emr-serverless/batch/"}
+            },
         },
+        wait_for_completion=True,
     )
